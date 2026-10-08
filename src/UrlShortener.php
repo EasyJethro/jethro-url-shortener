@@ -124,10 +124,10 @@ function getUrlShortener(): UrlShortener
 {
     static $shortener = null;
     if ($shortener !== null) return $shortener;
-    $key = defined('URLSHORTENER') ? (string) URLSHORTENER : '';
+    $key = defined('URLSHORTENER') ? (string) URLSHORTENER : 'https://jethro.au';
     if ($key === '') throw new \RuntimeException('URLSHORTENER not configured');
     $shortener = match ($key) {
-        'jethroau' => new JethroAuUrlShortener(apiKey: defined('URLSHORTENER_API_KEY') ? (string) URLSHORTENER_API_KEY : ''),
+        'jethroau', 'https://jethro.au' => new JethroAuUrlShortener(apiKey: defined('URLSHORTENER_API_KEY') ? (string) URLSHORTENER_API_KEY : ''),
         default => throw new \RuntimeException("Unknown URL shortener: $key"),
     };
     return $shortener;

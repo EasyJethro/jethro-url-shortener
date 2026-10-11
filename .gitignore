@@ -1,6 +1,7 @@
 node_modules
 .wrangler
-wrangler.toml
+.cloudflare
+cloudflare.config.ts
 README.jethro.md
 devbox.d
 .env

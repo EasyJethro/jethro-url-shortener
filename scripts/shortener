@@ -90,6 +90,11 @@ def main() -> None:
     p.add_argument("url", help="Long URL to shorten")
     p.add_argument("campaign", nargs="?", default="general", help="Campaign label")
 
+    # shorten-protected <url> [campaign]
+    p = sub.add_parser("shorten-protected", help="Create a short URL behind a bot check (block_bots)")
+    p.add_argument("url", help="Long URL to shorten")
+    p.add_argument("campaign", nargs="?", default="general", help="Campaign label")
+
     # stats <code>
     p = sub.add_parser("stats", help="Get click stats")
     p.add_argument("code", help="Short code")
@@ -137,6 +142,9 @@ def main() -> None:
 
     if cmd == "shorten":
         json_request("POST", f"{base_url}/api/shorten", headers={"Authorization": auth}, body={"url": args.url, "campaign": args.campaign})
+
+    elif cmd == "shorten-protected":
+        json_request("POST", f"{base_url}/api/shorten", headers={"Authorization": auth}, body={"url": args.url, "campaign": args.campaign, "block_bots": True})
 
     elif cmd == "stats":
         json_request("GET", f"{base_url}/api/stats/{args.code}")

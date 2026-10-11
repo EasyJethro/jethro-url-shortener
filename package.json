@@ -2,10 +2,11 @@
   "name": "jethro-url-shortener",
   "version": "1.0.0",
   "description": "Self-hosted URL shortener with Cloudflare Workers and KV storage",
+  "type": "module",
   "main": "worker.js",
   "scripts": {
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "dev": "cf dev",
+    "deploy": "cf deploy",
     "test": "node test_worker.js",
     "test:live": "BASE_URL=https://yourdomain.com node test_worker.js"
   },
@@ -19,6 +20,8 @@
   ],
   "license": "MIT",
   "devDependencies": {
-    "wrangler": "^4.104.0"
+    "@cloudflare/vite-plugin": "2.0.0-beta.sha-91c870c02",
+    "cf": "1.0.0-beta.14",
+    "vite": "^8.3.4"
   }
 }

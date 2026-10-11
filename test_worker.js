@@ -1,6 +1,6 @@
 /**
  * Integration tests for the URL Shortener Worker
- * Run with: npx wrangler dev --local (in one terminal), then node test_worker.js
+ * Run with: npx cf dev (in one terminal), then node test_worker.js
  *
  * Or run tests against your deployed worker:
  *   BASE_URL=https://yourdomain.com API_KEY=your-key node test_worker.js
@@ -91,6 +91,39 @@ async function runTests() {
       body: JSON.stringify({ url: 'https://example.com/', code: 'apikey:evil' }),
     });
     assert(resp.status === 400, `Expected 400, got ${resp.status}`);
+  });
+
+  await test('POST /api/shorten rejects non-boolean block_bots', async () => {
+    const resp = await fetch(`${BASE_URL}/api/shorten`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ url: 'https://example.com/', block_bots: 'yes' }),
+    });
+    assert(resp.status === 400, `Expected 400, got ${resp.status}`);
+  });
+
+  await test('block_bots URL serves a Turnstile challenge instead of redirecting', async () => {
+    const bbCode = `${testCode}-bb`;
+    const resp = await fetch(`${BASE_URL}/api/shorten`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ url: 'https://example.com/protected', code: bbCode, block_bots: true }),
+    });
+    // 501 when TURNSTILE_* secrets are not configured on this worker
+    if (resp.status === 501) return;
+    assert(resp.status === 200, `Expected 200, got ${resp.status}`);
+    try {
+      const get = await fetch(`${BASE_URL}/s/${bbCode}`, { redirect: 'manual' });
+      assert(get.status === 200, `Expected challenge page (200), got ${get.status}`);
+      assert((await get.text()).includes('cf-turnstile'), 'Expected Turnstile widget');
+      const post = await fetch(`${BASE_URL}/s/${bbCode}`, {
+        method: 'POST', redirect: 'manual', body: new URLSearchParams({ 'cf-turnstile-response': 'invalid' }),
+      });
+      assert(post.status === 403, `Expected invalid token to be rejected with 403, got ${post.status}`);
+    } finally {
+      await fetch(`${BASE_URL}/api/urls/${bbCode}`, { method: 'DELETE', headers });
+      await fetch(`${BASE_URL}/api/urls/${bbCode}/permanent`, { method: 'DELETE', headers });
+    }
   });
 
   // Signup / OAuth

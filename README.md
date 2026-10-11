@@ -9,13 +9,14 @@ A production-ready, self-hosted URL shortener built with **Cloudflare Workers** 
 ## Features
 
 - **Short URL redirects** — `/s/{code}` → full URL, served from edge cache with stale-while-revalidate
-- **Deterministic short codes** — SHA-256 hash of `(url, campaign)` makes creation idempotent: same inputs always produce the same code
+- **Deterministic short codes** — SHA-256 hash of `(url, campaign, block_bots)` makes creation idempotent: same inputs always produce the same code
 - **Click analytics** — per-code click counters in dedicated KV keys (reads never touch the URL mapping)
 - **Full CRUD API** — create, list, update, soft-delete, restore, permanent-delete
 - **Multi-key authentication** — admin and create-only API keys with full CRUD management, revocable without rotating the bootstrap key
 - **Self-service signup** — anyone can obtain a create-only key via Google, GitHub, or email magic link at `/signup`
 - **Campaign attribution** — keys created via the signup flow are stamped with a campaign id, and every URL shortened with that key inherits it — so you can trace which organisation created which link
 - **Privacy-preserving deregistration** — self-service key revocation (`DELETE /api/keys/mine`) scrubs owner identity and campaign from all URLs created by that key, while the shortened URLs themselves keep working
+- **Bot protection** — per-URL `block_bots` flag puts a Cloudflare Turnstile check in front of the redirect
 - **Campaign tagging** — organize URLs by campaign
 - **Notes field** — admin annotations per URL (up to 500 chars)
 - **Soft delete + restore** — data is preserved until you permanently remove it
@@ -32,9 +33,20 @@ Shortened URLs are of the form https://jethro.au/s/{code}.
 
 Upstream's short URL codes are a simple integer counter.
 
-Our codes are derived from a SHA-256 hash of `(url, campaign)`, making creation **idempotent** — posting the same URL + campaign always returns the same short code. The campaign acts as a salt: same URL with different campaigns produces different codes. By default the campaign is the first 8 characters of the API key, so each installation produces different codes for the same URL — unguessable across tenants. You can override the campaign to a semantic tag (e.g. `"sms"`, `"email"`) for filtering in listings. Short codes are 6-character alphanumeric, collision-resistant.
+Our codes are derived from a SHA-256 hash of `(url, campaign, block_bots)`, making creation **idempotent** — posting the same URL + campaign (+ optional `block_bots` flag) always returns the same short code. The campaign acts as a salt: same URL with different campaigns produces different codes. By default the campaign is the first 8 characters of the API key, so each installation produces different codes for the same URL — unguessable across tenants. You can override the campaign to a semantic tag (e.g. `"sms"`, `"email"`) for filtering in listings. Short codes are 6-character alphanumeric, collision-resistant.
 
-Being deterministic allows the client to determine what the code will be, ahead of time. This allows the SMS preview to show a shortened URL calculated locally, and only actually hit the https://jethro.au shortener API when a SMS is actually sent. This makes previewing fast and cheap, which is necessary because it happens on each keypress (debounced).
+Being deterministic allows the client to determine what the code will be, ahead of time. In Jethro, this allows the SMS preview to show a shortened URL calculated locally, and only actually hit the https://jethro.au shortener API when a SMS is actually sent. This makes previewing fast and cheap, which is necessary because it happens on each keypress (debounced).
+
+### Bot protection
+
+Scenario: you have deployed a webapp to https://my-webapp.fly.dev or https://myapp-12345.shellbox.dev, 'scale to zero' hosting providers that only run your app when requests come in, and shut it down after inactivity. You need to post a public URL to your app, but don't want random crawlers triggering wake-ups and using bandwidth. Now you can run:
+
+```
+devbox run shorten-protected https://my-webapp.fly.dev/
+```
+
+and get a shortened URL that opens to a Cloudflare 'turnstile' page checking the requester is human, before redirecting to the shortened app.
+
 
 ### No UTM parameter injection
 
@@ -53,7 +65,7 @@ Two key types stored in KV with full CRUD management:
 | `admin` | Full access — create, list, update, delete URLs; manage API keys |
 | `create` | Create-only — can shorten URLs, cannot list/update/delete |
 
-Keys are revocable without rotating the bootstrap admin key. The bootstrap key is set via `wrangler secret put API_KEY` and stored as a Cloudflare Workers secret.
+Keys are revocable without rotating the bootstrap admin key. The bootstrap key is set via `cf workers secrets update API_KEY` and stored as a Cloudflare Workers secret.
 
 ### Self-service API keys (OAuth + email signup)
 
@@ -67,7 +79,7 @@ All API keys (bootstrap, admin-created, and self-service) are stored hashed: `to
 
 Key holders can deregister themselves via `DELETE /api/keys/mine`, which revokes the key and scrubs their `createdBy` / `createdByCampaign` attribution from any URLs they created. The shortened URLs themselves are untouched — they continue to work, just anonymously.
 
-Setup is optional — see [step 6 of the Quick Start](#6-optional-enable-self-service-api-key-signup). Providers with no client ID configured are hidden from `/signup`; with neither configured the page returns 501 and the feature is effectively off.
+Setup is optional — see [step 5 of the Quick Start](#5-optional-enable-self-service-api-key-signup). Providers with no client ID configured are hidden from `/signup`; with neither configured the page returns 501 and the feature is effectively off.
 
 ### Devbox tooling
 
@@ -110,6 +122,12 @@ $s->fetchRedirect('https://jethro.au/s/abc123');           // → ['status' => 3
 // You can override the campaign for semantic tagging (e.g. "sms", "email"):
 $s->shorten('https://example.com/long', campaign: 'email');
 
+// Bot protection: visitors must pass a Turnstile check before redirecting.
+// $blockBots is part of the code hash, so protected and unprotected links to
+// the same URL get different codes.
+$s->shorten('https://example.com/long', campaign: 'sms', blockBots: true);
+$s->previewShorten('https://example.com/long', campaign: 'sms', blockBots: true);
+
 // Build a signup URL that stamps the key with a campaign id:
 $signupUrl = $s->getSignupUrl('https://my.app/callback', 'my-organisation');
 // → https://jethro.au/signup?redirect=...&campaign=my-organisation
@@ -124,11 +142,23 @@ devbox run -- php shorten.php https://example.com/my-post twitter
 
 ### Tests
 
+`devbox run test` — PHP functional test against the live API: predicts a short code via `previewShorten()`, creates it via the live API, confirms the codes match, fetches the short URL, and validates the 302 redirect to the original target.
+
+`node test_worker.js` — Worker HTTP integration suite (20 tests). Point it at a deployed worker, or run the worker locally:
+
 ```bash
-devbox run test
+# .dev.vars holds local values for secrets declared in cloudflare.config.ts
+cat > .dev.vars <<'EOF'
+API_KEY=test-key
+TURNSTILE_SITE_KEY=1x00000000000000000000AA
+TURNSTILE_SECRET_KEY=dummy-secret-for-local-tests
+EOF
+
+npx cf dev                                   # serves on http://localhost:5173
+BASE_URL=http://localhost:5173 API_KEY=test-key node test_worker.js
 ```
 
-Functional test verifies the full pipeline: predicts a short code via `previewShorten()`, creates it via the live API, confirms the codes match, fetches the short URL, and validates the 302 redirect to the original target.
+`.dev.vars` is gitignored. Secrets not declared in `cloudflare.config.ts` are not loaded by `cf dev`. When `TURNSTILE_*` are unset, the `block_bots` test skips its assertions instead of failing.
 
 ## Architecture
 
@@ -154,49 +184,39 @@ npm install
 ### 2. Create a KV namespace
 
 ```
-npx wrangler kv:namespace create URL_MAPPINGS
+npx cf kv namespaces create --title URL_MAPPINGS
 ```
 
-### 3. Configure `wrangler.toml`
+### 3. Configure `cloudflare.config.ts`
 
 ```bash
-cp wrangler.toml.example wrangler.toml
+cp cloudflare.config.example.ts cloudflare.config.ts
 ```
 
-Replace the placeholders:
+In `cloudflare.config.ts` replace every `yourdomain.com` with your actual domain, and replace `YOUR_KV_NAMESPACE_ID` with the namespace printed in step 2:
 
-```toml
-[[kv_namespaces]]
-binding = "URL_MAPPINGS"
-id = "YOUR_KV_NAMESPACE_ID"   # from step 2
-
-[[routes]]
-pattern = "yourdomain.com/s/*"
-zone_name = "yourdomain.com"
+```ts
+triggers.fetch({ pattern: "yourdomain.com/s/*", zone: "yourdomain.com" }),
+// ...
+URL_MAPPINGS: bindings.kv({ id: "YOUR_KV_NAMESPACE_ID" }), // from step 2
 ```
+
+The example config also routes the zone root (`yourdomain.com/`) to the worker's landing page. If you upgraded from an earlier version, add that trigger too — without it requests to `/` fall through to the origin and hang:
 
 ### 4. Set your admin API key
 
 ```bash
 cp .env.example .env
 # Add URLSHORTENER_ADMIN_KEY=your-secret-value
-npx wrangler secret put API_KEY
-# Enter the same secret when prompted
+npx cf workers secrets update API_KEY --worker url-shortener --type secret_text   # Enter "$URLSHORTENER_ADMIN_KEY"
 ```
 
 This is your **bootstrap admin key** — it has full access and cannot be revoked via the API. Use it to create additional keys (including scoped create-only keys) via `/api/keys`.
 
-### 5. Deploy
 
-```bash
-npx wrangler deploy
-```
+### 5. (Optional) Enable self-service API key signup
 
-That's it — your URL shortener is live at `https://yourdomain.com/s/*`.
-
-### 6. (Optional) Enable self-service API key signup
-
-Lets anyone mint their own `create`-scoped key by signing in at `https://yourdomain.com/signup`. Skip this step and the feature stays off. You can enable any or all of the three providers: Google OAuth, GitHub OAuth, and email magic link.
+This step lets anyone mint their own `create`-scoped key by signing in at `https://yourdomain.com/signup`. Skip this step and the feature stays off. You can enable any or all of the three providers: Google OAuth, GitHub OAuth, and email magic link.
 
 **Google** (in [Google Cloud Console](https://console.cloud.google.com/)):
 
@@ -205,29 +225,104 @@ Lets anyone mint their own `create`-scoped key by signing in at `https://yourdom
 3. Under  [Google Auth Platform → Clients → Create client](https://console.cloud.google.com/auth/clients/create) click **Create Credentials → OAuth client ID**, application type **Web application**.
 4. Add the authorized redirect URI: `https://yourdomain.com/auth/google/callback`
 5. Copy the **Client ID** and **Client secret**.
+6. Run:
+
+```sh
+npx cf workers secrets update GOOGLE_CLIENT_ID --worker url-shortener --type secret_text   # Enter **Client ID**
+npx cf workers secrets update GOOGLE_CLIENT_SECRET --worker url-shortener --type secret_text   # Enter "**Client secret**"
+```
 
 **GitHub** (in [Developer settings → OAuth Apps](https://github.com/settings/developers)):
 
 1. Click **New OAuth App**.
 2. Set an application name, homepage URL `https://yourdomain.com`, and authorization callback URL: `https://yourdomain.com/auth/github/callback`
 3. Register, then click **Generate a new client secret**. Copy the **Client ID** and the secret.
+4. Run:
+
+```sh
+npx cf workers secrets update GITHUB_CLIENT_ID --worker url-shortener --type secret_text  # Enter Github **Client ID**
+npx cf workers secrets update GITHUB_CLIENT_SECRET --worker url-shortener --type secret_text  # Enter Github **Client secret**
+```
 
 **Email magic link** (uses [Resend](https://resend.com) to deliver the link):
 
-1. Create a free [Resend](https://resend.com) account and get an API key.
+1. Create a [Resend](https://resend.com) account and get an API key. The API key only needs permission 'Sending access'.
 2. Verify your sending domain, or use Resend's testing domain for development.
-
-**Store the credentials as Worker secrets** and redeploy:
+3. Run:
 
 ```bash
-npx wrangler secret put GOOGLE_CLIENT_ID
-npx wrangler secret put GOOGLE_CLIENT_SECRET
-npx wrangler secret put GITHUB_CLIENT_ID
-npx wrangler secret put GITHUB_CLIENT_SECRET
-npx wrangler secret put EMAIL_API_KEY     # Resend API key
-npx wrangler secret put EMAIL_FROM        # e.g. "shortener@yourdomain.com"
-npx wrangler deploy
+npx cf workers secrets update EMAIL_API_KEY --worker url-shortener --type secret_text    # Enter Resend API key
+npx cf workers secrets update EMAIL_FROM --worker url-shortener --type secret_text  # e.g. "shortener@yourdomain.com"
 ```
+
+### 6. (Optional) Enable bot protection for `block_bots` URLs
+
+URLs created with `"block_bots": true` show a [Cloudflare Turnstile](https://developers.cloudflare.com/turnstile/) check before redirecting. Turnstile is free on the Free plan (up to 20 widgets per account, 10 hostnames per widget).
+
+Create a widget for your domain (or use the dashboard: Turnstile → Add widget). The response contains the widget's `sitekey` and `secret`:
+
+```bash
+npx cf turnstile widgets create --name url-shortener --domains yourdomain.com --widget-mode managed
+```
+
+Store both values as Worker secrets:
+
+```bash
+npx cf workers secrets update TURNSTILE_SITE_KEY --worker url-shortener --type secret_text    # Widget sitekey
+npx cf workers secrets update TURNSTILE_SECRET_KEY --worker url-shortener --type secret_text  # Widget secret
+```
+
+If you lose the secret, find the widget with `npx cf turnstile widgets list` and rotate it with `npx cf turnstile widgets rotate-secret <sitekey>` rather than creating another widget. Rotating invalidates outstanding `bot_pass` cookies, since the secret also signs them.
+
+Without both secrets, requests with `block_bots: true` are rejected with 501, and existing protected links return 503 (fail closed).
+
+### 7. (Optional) Receive replies with Cloudflare Email Routing
+
+If you enabled self-signup, the URL shortener gained the ability to send signup emails a validation 'magic link'. That email would be sent through Resend.com, and will come from the `EMAIL_FROM` address (e.g. `shortener@yourdomain.com`).
+
+Most probably, you don't expect or care about any emails sent _to_ `shortener@yourdomain.com` - it's just there for the magic link - but if you _do_ want emails there to go to a person, here is how.
+
+First: Resend.com would be the logical choice (it's the email sender, why not also receive?), and it [is possible](https://resend.com/docs/dashboard/receiving/forward-emails) but only through a horrible webhook + code solution.
+
+A simpler alternative is [Cloudflare Email Routing](https://developers.cloudflare.com/email-routing/), which forwards mail sent to an address on your domain to an existing mailbox. It only receives mail; magic links are still sent through Resend. 
+
+To set this up:
+
+1. Enable Email Routing for the zone. This adds and locks the required MX and SPF records:
+
+```bash
+npx cf email-routing enable -z yourdomain.com
+```
+
+2. Add the destination mailbox. Cloudflare emails it a verification link, which must be clicked before the rule in step 3 can be created:
+
+```bash
+npx cf email-routing addresses create --email you@example.com
+```
+
+3. Forward the address to that mailbox:
+
+```bash
+npx cf email-routing rules create -z yourdomain.com \
+  --name "shortener -> you" \
+  --matchers '[{"type":"literal","field":"to","value":"shortener@yourdomain.com"}]' \
+  --actions '[{"type":"forward","value":["you@example.com"]}]'
+```
+
+4. Check that it's enabled (`"enabled": true`) and the rule exists, then send a test message to `shortener@yourdomain.com`:
+
+```bash
+npx cf email-routing settings get -z yourdomain.com
+npx cf email-routing rules list -z yourdomain.com
+```
+
+### 8. Deploy
+
+```bash
+npx cf deploy
+```
+
+That's it — your URL shortener is live at `https://yourdomain.com/s/*`.
 
 Visit `https://yourdomain.com/signup` to test: sign in, and your API key is shown once. Each identity holds one key; signing in again revokes the old key and issues a new one. Keys and their owners are visible to admins via `GET /api/keys`.
 
@@ -245,7 +340,8 @@ curl -X POST https://yourdomain.com/api/shorten \
     "url": "https://example.com/very/long/blog/post/",
     "code": "oauth",          # optional custom code (auto-generated if omitted)
     "campaign": "blog_post",  # optional campaign tag (default: "general")
-    "notes": "OAuth guide"    # optional admin note (max 500 chars)
+    "notes": "OAuth guide",   # optional admin note (max 500 chars)
+    "block_bots": true        # optional: require a Turnstile bot check before redirecting
   }'
 ```
 
@@ -258,7 +354,9 @@ Response:
 }
 ```
 
-If the same URL + campaign was already created, the response includes `"existing": true` and returns the existing short code (idempotent).
+If the same URL + campaign was already created, the response includes `"existing": true` and returns the existing short code (idempotent). `block_bots` is part of the identity: protected and unprotected links to the same URL get different codes (hash of `url::campaign::block_bots`).
+
+`block_bots` links: `GET /s/{code}` returns a Turnstile page; the widget POSTs its token to `/s/{code}`, the worker verifies it with Cloudflare's siteverify API, then 303-redirects and sets a signed `bot_pass` cookie (30 minutes, all `/s/` links) so the visitor isn't challenged again. These responses are never cached, and clicks are counted only after a pass. CLI: `devbox run shorten-protected <url> [campaign]`.
 
 ### Get click statistics
 
@@ -300,7 +398,7 @@ curl -X PUT https://yourdomain.com/api/urls/oauth \
   -d '{"url": "https://example.com/new-url/", "campaign": "updated", "notes": "Updated destination"}'
 ```
 
-You can update the target URL, campaign, short code (rename), and notes. Requires admin key.
+You can update the target URL, campaign, short code (rename), notes, and `block_bots`. Requires admin key.
 
 ### Soft delete (recoverable)
 
@@ -368,7 +466,7 @@ curl -X DELETE https://yourdomain.com/api/keys/{id} \
   -H "Authorization: Bearer YOUR_API_KEY"
 ```
 
-Requires admin key. The bootstrap admin key (set via `wrangler secret`) cannot be revoked via the API.
+Requires admin key. The bootstrap admin key (set via `cf workers secrets update`) cannot be revoked via the API.
 
 ### Revoke your own key (self-service deregistration)
 
@@ -411,11 +509,11 @@ Purges are eventually consistent — expect a few seconds of propagation delay a
 
 ### Configuration
 
-Cache is enabled in `wrangler.toml` with `cache = { enabled = true }`. The `compatibility_date` must be `2026-05-01` or later.
+Cache is enabled in `cloudflare.config.ts` with `cache: { enabled: true }`. The `compatibilityDate` must be `2026-05-01` or later.
 
 ### Local Development
 
-Workers Cache is a Cloudflare edge product and is **not** available in `wrangler dev --local`. The code guards against `ctx.cache` being undefined, so all endpoints continue to work normally without caching during local development.
+Workers Cache is a Cloudflare edge product and is **not** available in `cf dev`. The code guards against `ctx.cache` being undefined, so all endpoints continue to work normally without caching during local development.
 
 ## Cost Analysis
 

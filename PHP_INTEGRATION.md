@@ -139,6 +139,27 @@ curl -X POST https://jethro.au/api/shorten \
 # Should return 200 with a shortUrl
 ```
 
+## Step 5 — Shorten with bot protection (optional)
+
+Add `"block_bots": true` to require visitors to pass a Cloudflare Turnstile check before the redirect. The flag is part of the code hash, so a protected link and an unprotected link to the same URL get **different** codes.
+
+```bash
+curl -X POST https://jethro.au/api/shorten \
+  -H "Authorization: Bearer <key-from-conf.php>" \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://example.com/test", "campaign": "integration-test", "block_bots": true}'
+```
+
+From PHP, pass `blockBots: true` to the library; `previewShorten()` predicts the matching code with the same parameters:
+
+```php
+$protected = $s->shorten('https://example.com/test', campaign: 'integration-test', blockBots: true);
+$predicted = $s->previewShorten('https://example.com/test', campaign: 'integration-test', blockBots: true);
+// $protected === $predicted
+```
+
+Requires `TURNSTILE_SITE_KEY` / `TURNSTILE_SECRET_KEY` on the worker (see README step 5b). Without them the API returns 501 for `"block_bots": true`.
+
 ## Reference
 
 ### JethroAuUrlShortener signup methods
@@ -148,6 +169,16 @@ curl -X POST https://jethro.au/api/shorten \
 | `getSignupUrl(string $redirectAfter): string` | Build the signup URL. `$redirectAfter` is the absolute URL the worker will redirect back to with the key. Must be same-origin as the signup request. |
 | `isSignupCallback(): bool` | Returns `true` if the current request contains a signup callback (`sh_apikey` in GET params). |
 | `getTokenFromCallback(): ?array` | Extracts `{token, email, replaced}` from the callback, or `null` if invalid/absent. |
+
+### JethroAuUrlShortener shortening methods
+
+| Method | Description |
+|--------|-------------|
+| `shorten(string $url, ?string $campaign = null, bool $blockBots = false): string` | Create (or fetch, if already created) a short URL. `$campaign` defaults to the API-key prefix; `$blockBots` requires a Turnstile check before the redirect. |
+| `previewShorten(string $url, ?string $campaign = null, bool $blockBots = false): string` | Predict the short URL locally, without an API call. Must be passed the same arguments as `shorten()` or the predicted code will differ. |
+| `fetchRedirect(string $shortUrl): array` | Fetch a short URL and return `['status' => int, 'location' => string]`. |
+
+`block_bots` is part of the code hash, so `shorten(..., blockBots: true)` and `previewShorten(..., blockBots: true)` agree with each other, while a protected link never collides with an unprotected one for the same URL and campaign.
 
 ### Callback query parameters
 
@@ -167,7 +198,7 @@ The worker appends these to your `redirect` URL:
 
 | Problem | Likely cause |
 |---------|-------------|
-| `/signup` returns 501 | OAuth provider secrets not set (`wrangler secret put GOOGLE_CLIENT_ID` etc.) |
+| `/signup` returns 501 | OAuth provider secrets not set (`cf workers secrets update GOOGLE_CLIENT_ID` etc.) |
 | Google shows `redirect_uri_mismatch` | The redirect URI registered in Google Console must be `https://yourdomain/auth/google/callback` |
 | Callback redirect doesn't fire | The `redirect` param value must be same-origin; check for typos, missing `https://`, or trailing whitespace |
 | Key doesn't work after callback | The worker must be deployed with the latest code (supporting `?redirect=`); deploy first |

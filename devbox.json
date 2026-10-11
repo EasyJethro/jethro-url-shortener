@@ -16,11 +16,12 @@
     ],
     "scripts": {
       "test":            "php test.php \"$@\"",
-      "deploy": "npx wrangler deploy",
+      "deploy": "npx cf deploy",
       "help": [
         "echo '  deploy                          Redeploy the worker'",
         "echo ''",
         "echo '  shorten <url> [campaign]      Create a short URL'",
+        "echo '  shorten-protected <url> [camp] Create a short URL behind a bot check'",
         "echo '  stats <code>                  Get click stats'",
         "echo '  list-urls                      List all active URLs'",
         "echo '  update-url <code> <url> [camp] Update a URL'",
@@ -34,6 +35,7 @@
         "echo '  help                           Show this help'"
       ],
       "shorten":          "scripts/shortener shorten \"$@\"",
+      "shorten-protected": "scripts/shortener shorten-protected \"$@\"",
       "list-urls":        "scripts/shortener list-urls",
       "list-keys":        "scripts/shortener list-keys",
       "stats":            "scripts/shortener stats \"$@\"",

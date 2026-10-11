@@ -5,10 +5,13 @@
 
 interface UrlShortener
 {
+    /**
+     * @param string|null $campaign defaults to the first 8 chars of the API key
+     * @param bool $blockBots visitors must pass a Cloudflare Turnstile bot check before redirecting
+     */
+    public function shorten(string $url, ?string $campaign = null, bool $blockBots = false): string;
     /** @param string|null $campaign defaults to the first 8 chars of the API key */
-    public function shorten(string $url, ?string $campaign = null): string;
-    /** @param string|null $campaign defaults to the first 8 chars of the API key */
-    public function previewShorten(string $url, ?string $campaign = null): string;
+    public function previewShorten(string $url, ?string $campaign = null, bool $blockBots = false): string;
     public function fetchRedirect(string $shortUrl): array;
 }
 
@@ -68,18 +71,18 @@ class JethroAuUrlShortener implements UrlShortener
         ];
     }
 
-    public function shorten(string $url, ?string $campaign = null): string
+    public function shorten(string $url, ?string $campaign = null, bool $blockBots = false): string
     {
         $campaign ??= substr($this->apiKey, 0, 8);
         static $cache = [];
-        $key = $url . '|' . $campaign;
+        $key = $url . '|' . $campaign . '|' . (int)$blockBots;
         if (isset($cache[$key])) return $cache[$key];
 
         $ch = curl_init($this->endpoint);
         curl_setopt_array($ch, [
             CURLOPT_POST => true, CURLOPT_RETURNTRANSFER => true,
             CURLOPT_HTTPHEADER => ["Authorization: Bearer {$this->apiKey}", 'Content-Type: application/json'],
-            CURLOPT_POSTFIELDS => json_encode(['url' => $url, 'campaign' => $campaign]),
+            CURLOPT_POSTFIELDS => json_encode(['url' => $url, 'campaign' => $campaign, 'block_bots' => $blockBots]),
             CURLOPT_TIMEOUT => 5,
         ]);
         $body = curl_exec($ch);
@@ -99,10 +102,10 @@ class JethroAuUrlShortener implements UrlShortener
         return $cache[$key] = $shortUrl;
     }
 
-    public function previewShorten(string $url, ?string $campaign = null): string
+    public function previewShorten(string $url, ?string $campaign = null, bool $blockBots = false): string
     {
         $campaign ??= substr($this->apiKey, 0, 8);
-        $code = substr(hash('sha256', $url . '::' . $campaign), 0, 6);
+        $code = substr(hash('sha256', $url . '::' . $campaign . ($blockBots ? '::block_bots' : '')), 0, 6);
         return 'https://jethro.au/s/' . $code;
     }
 

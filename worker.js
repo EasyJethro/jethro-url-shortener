@@ -8,12 +8,12 @@
  * - Soft delete + restore + permanent delete
  * - Self-service API keys: /signup mints a create-scoped key via Google/GitHub OAuth
  *
- * Deploy: wrangler deploy
+ * Deploy: cf deploy
  * Companion article: https://www.iamdevbox.com/posts/building-self-hosted-url-shortener-cloudflare-workers/
  */
 
 // KV namespace binding: URL_MAPPINGS
-// Configure in wrangler.toml
+// Configure in cloudflare.config.ts
 
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
@@ -30,9 +30,11 @@ export default {
       return new Response(null, { headers: CORS_HEADERS });
     }
 
-    // Short URL redirect: /s/{code}
+    // Short URL redirect: /s/{code}. POST carries a Turnstile token for
+    // block_bots URLs.
     if (url.pathname.startsWith('/s/')) {
-      return handleShortUrl(url, env, ctx);
+      if (request.method === 'POST') return handleBotCheck(request, url, env, ctx);
+      return handleShortUrl(request, url, env, ctx);
     }
 
     // API: Create short URL (authenticated — admin or create)
@@ -94,6 +96,17 @@ export default {
       return handleDeleteUrl(request, url, env, ctx);
     }
 
+    // Landing page
+    if (url.pathname === '/' && request.method === 'GET') {
+      return htmlResponse(`<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>jethro.au</title></head>
+<body>
+  <p>jethro.au hosts web services for use by any installation of the Jethro church management system. Currently it runs a <a href="https://github.com/jefft/jethro-url-shortener">URL shortener</a>, with signup initiated in Jethro's System Configuration page. For more info, contact <a href="mailto:support@easyjethro.com.au">support@easyjethro.com.au</a>.</p>
+</body>
+</html>`);
+    }
+
     // Self-service signup: OAuth login → mint a create-scoped API key
     if (url.pathname === '/signup' && request.method === 'GET') {
       try {
@@ -127,9 +140,10 @@ export default {
 };
 
 /**
- * Redirect /s/{code} to the target URL
+ * Redirect /s/{code} to the target URL. block_bots URLs get a Turnstile
+ * challenge page unless the client holds a valid pass cookie.
  */
-async function handleShortUrl(url, env, ctx) {
+async function handleShortUrl(request, url, env, ctx) {
   const code = url.pathname.split('/s/')[1];
 
   // Codes never contain ':' — reject early so reserved KV records
@@ -148,6 +162,24 @@ async function handleShortUrl(url, env, ctx) {
       return new Response(null, {
         status: 404,
         headers: { 'Cache-Control': 'no-store' },
+      });
+    }
+
+    if (mapping.block_bots) {
+      if (!turnstileConfigured(env)) {
+        return new Response('Bot protection is not configured', {
+          status: 503,
+          headers: { 'Cache-Control': 'no-store' },
+        });
+      }
+      if (!(await hasValidBotPass(request, env))) {
+        return htmlResponse(botCheckPage(env), 200);
+      }
+      // Never cache: the cache would serve the redirect to unchallenged clients.
+      ctx.waitUntil(incrementStats(code, env));
+      return new Response(null, {
+        status: 302,
+        headers: { Location: mapping.url, 'Cache-Control': 'no-store' },
       });
     }
 
@@ -171,7 +203,7 @@ async function handleShortUrl(url, env, ctx) {
 
 /**
  * POST /api/shorten — Create a new short URL
- * Body: { url, code?, campaign?, notes? }
+ * Body: { url, code?, campaign?, notes?, block_bots? }
  */
 async function handleCreateShortUrl(request, env) {
   try {
@@ -180,6 +212,14 @@ async function handleCreateShortUrl(request, env) {
 
     const body = await request.json();
     const { url: longUrl, code, notes } = body;
+    const blockBots = body.block_bots ?? false;
+
+    if (typeof blockBots !== 'boolean') {
+      return jsonResponse({ error: 'block_bots must be a boolean' }, 400);
+    }
+    if (blockBots && !turnstileConfigured(env)) {
+      return jsonResponse({ error: 'block_bots is not available: bot protection is not configured on this server' }, 501);
+    }
 
     if (!longUrl) {
       return jsonResponse({ error: 'url is required' }, 400);
@@ -209,8 +249,8 @@ async function handleCreateShortUrl(request, env) {
       return jsonResponse({ error: 'campaign must be a string of at most 64 characters' }, 400);
     }
 
-    // Check idempotency: same URL + campaign → same code
-    const idxKey = await hashKey(longUrl, campaign);
+    // Check idempotency: same URL + campaign + block_bots → same code
+    const idxKey = await hashKey(longUrl, campaign, blockBots);
     const existingIdx = await env.URL_MAPPINGS.get(`idx:${idxKey}`, { type: 'json' });
     if (existingIdx) {
       const existingMapping = await env.URL_MAPPINGS.get(existingIdx.code, { type: 'json' });
@@ -220,13 +260,14 @@ async function handleCreateShortUrl(request, env) {
           shortUrl: `${baseUrl}/s/${existingIdx.code}`,
           code: existingIdx.code,
           longUrl: existingMapping.url,
+          block_bots: !!existingMapping.block_bots,
           existing: true,
         });
       }
       // If it was soft-deleted, fall through and recreate
     }
 
-    const shortCode = code || await generateShortCode(longUrl, campaign, env);
+    const shortCode = code || await generateShortCode(longUrl, campaign, blockBots, env);
 
     const existingCode = await env.URL_MAPPINGS.get(shortCode);
     if (existingCode) {
@@ -245,6 +286,7 @@ async function handleCreateShortUrl(request, env) {
       campaign,
       created: new Date().toISOString(),
       stats: { total: 0 },
+      ...(blockBots ? { block_bots: true } : {}),
     };
 
     if (auth.owner) {
@@ -265,6 +307,7 @@ async function handleCreateShortUrl(request, env) {
       shortUrl: `${baseUrl}/s/${shortCode}`,
       code: shortCode,
       longUrl,
+      block_bots: blockBots,
     });
   } catch (error) {
     console.error('Error creating short URL:', error);
@@ -338,6 +381,7 @@ async function handleListUrls(request, env) {
           ...(mapping.notes ? { notes: mapping.notes } : {}),
           ...(mapping.createdBy ? { createdBy: mapping.createdBy } : {}),
           ...(mapping.createdByCampaign ? { createdByCampaign: mapping.createdByCampaign } : {}),
+          ...(mapping.block_bots ? { block_bots: true } : {}),
         });
       }
 
@@ -355,7 +399,7 @@ async function handleListUrls(request, env) {
 }
 
 /**
- * PUT /api/urls/{code} — Update URL, campaign, code, or notes
+ * PUT /api/urls/{code} — Update URL, campaign, code, notes, or block_bots
  */
 async function handleUpdateUrl(request, url, env, ctx) {
   const authErr = await requireAdmin(request, env);
@@ -373,7 +417,14 @@ async function handleUpdateUrl(request, url, env, ctx) {
     }
 
     const body = await request.json();
-    const { url: newUrl, campaign, code: newCode, notes } = body;
+    const { url: newUrl, campaign, code: newCode, notes, block_bots: blockBots } = body;
+
+    if (blockBots !== undefined && typeof blockBots !== 'boolean') {
+      return jsonResponse({ error: 'block_bots must be a boolean' }, 400);
+    }
+    if (blockBots && !turnstileConfigured(env)) {
+      return jsonResponse({ error: 'block_bots is not available: bot protection is not configured on this server' }, 501);
+    }
 
     if (newUrl) {
       const urlErr = validateTargetUrl(newUrl);
@@ -412,6 +463,7 @@ async function handleUpdateUrl(request, url, env, ctx) {
     if (existing.deleted !== undefined) updated.deleted = existing.deleted;
     if (existing.createdBy) updated.createdBy = existing.createdBy;
     if (existing.createdByCampaign) updated.createdByCampaign = existing.createdByCampaign;
+    if (blockBots !== undefined ? blockBots : existing.block_bots) updated.block_bots = true;
 
     if (notes !== undefined) {
       if (notes.trim()) updated.notes = notes.trim();
@@ -432,7 +484,7 @@ async function handleUpdateUrl(request, url, env, ctx) {
       purgeCacheForCode(ctx, oldCode);
       purgeCacheForCode(ctx, newCode);
 
-      return jsonResponse({ code: newCode, oldCode, ...updated });
+      return jsonResponse({ code: newCode, oldCode, ...updated, block_bots: !!updated.block_bots });
     }
 
     await env.URL_MAPPINGS.put(oldCode, JSON.stringify(updated));
@@ -440,7 +492,7 @@ async function handleUpdateUrl(request, url, env, ctx) {
     // Invalidate cache for the updated code
     purgeCacheForCode(ctx, oldCode);
 
-    return jsonResponse({ code: oldCode, ...updated });
+    return jsonResponse({ code: oldCode, ...updated, block_bots: !!updated.block_bots });
   } catch (error) {
     console.error('Error updating URL:', error);
     return jsonResponse({ error: 'Internal Server Error' }, 500);
@@ -624,8 +676,8 @@ async function incrementStats(code, env) {
  * Uses the first 6 chars of SHA-256 hex digest.
  * Falls back to random if the deterministic code is taken (collision).
  */
-async function generateShortCode(url, campaign, env) {
-  const hk = await hashKey(url, campaign);       // 64-char hex SHA-256
+async function generateShortCode(url, campaign, blockBots, env) {
+  const hk = await hashKey(url, campaign, blockBots); // 64-char hex SHA-256
   const detCode = hk.slice(0, 6);                // 16^6 ≈ 16M combinations
   const existing = await env.URL_MAPPINGS.get(detCode);
   if (!existing) return detCode;
@@ -645,11 +697,13 @@ async function generateShortCode(url, campaign, env) {
 }
 
 /**
- * Hash URL + campaign for idempotency lookup.
+ * Hash URL + campaign (+ block_bots marker) for idempotency lookup.
+ * The marker is only appended when set, so unprotected codes are unchanged
+ * and a protected link never collides with an unprotected one.
  * Returns a hex string.
  */
-async function hashKey(url, campaign) {
-  return sha256Hex(`${url}::${campaign}`);
+async function hashKey(url, campaign, blockBots = false) {
+  return sha256Hex(`${url}::${campaign}${blockBots ? '::block_bots' : ''}`);
 }
 
 /**
@@ -713,7 +767,7 @@ function purgeCacheForCode(ctx, code) {
 /**
  * Verify Bearer token API key. Returns { authorized, type, owner?, keyId? }.
  *
- * Bootstrap key (env.API_KEY, set via wrangler secret) always has admin access.
+ * Bootstrap key (env.API_KEY, set via cf workers secrets update) always has admin access.
  * All other keys are looked up O(1) by SHA-256(token) → tok:{hash} → apikey:{id}.
  * There is no plaintext-token walk — keys are always stored hashed.
  */
@@ -1002,7 +1056,7 @@ function jsonResponse(data, status = 200) {
 //   tok:{sha256}    → { id }        (O(1) auth lookup)
 //   owner:{ident}   → { keyId }     (one-key-per-identity replacement)
 //
-// Secrets (wrangler secret put): GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET,
+// Secrets (cf workers secrets update): GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET,
 // GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET. A provider with no client ID is
 // hidden from /signup and its /auth routes return 501.
 // ---------------------------------------------------------------------------
@@ -1579,4 +1633,116 @@ function htmlResponse(html, status = 200, extraHeaders = {}) {
       ...extraHeaders,
     },
   });
+}
+
+// ---------------------------------------------------------------------------
+// Bot protection (Cloudflare Turnstile) for block_bots URLs
+//
+// GET /s/{code} → challenge page with the Turnstile widget → widget auto-POSTs
+// its token to /s/{code} → siteverify → set signed pass cookie → 303 to target.
+// Secrets: TURNSTILE_SITE_KEY, TURNSTILE_SECRET_KEY. The secret also signs the
+// pass cookie, so rotating it invalidates outstanding passes.
+// ---------------------------------------------------------------------------
+
+const BOT_PASS_COOKIE = 'bot_pass';
+const BOT_PASS_TTL = 30 * 60; // seconds
+
+function turnstileConfigured(env) {
+  return !!(env.TURNSTILE_SITE_KEY && env.TURNSTILE_SECRET_KEY);
+}
+
+async function hmacHex(secret, message) {
+  const key = await crypto.subtle.importKey(
+    'raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(message));
+  return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function hasValidBotPass(request, env) {
+  const raw = getCookie(request, BOT_PASS_COOKIE);
+  if (!raw) return false;
+  const [exp, sig] = raw.split('.');
+  if (!exp || !sig || !(Number(exp) > Date.now() / 1000)) return false;
+  return sig === await hmacHex(env.TURNSTILE_SECRET_KEY, `bot_pass:${exp}`);
+}
+
+function botCheckPage(env, error = '') {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Checking your browser…</title>
+  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+  <style>body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 4rem auto; padding: 0 1rem; line-height: 1.5; }</style>
+</head>
+<body>
+  <p>${error ? escapeHtml(error) + ' ' : ''}Please confirm you are not a robot to continue.</p>
+  <form method="post" id="f">
+    <div class="cf-turnstile" data-sitekey="${escapeHtml(env.TURNSTILE_SITE_KEY)}" data-callback="onPass"></div>
+    <noscript><p>JavaScript is required to continue.</p></noscript>
+  </form>
+  <script>function onPass() { document.getElementById('f').submit(); }</script>
+</body>
+</html>`;
+}
+
+/**
+ * POST /s/{code} — verify a Turnstile token, then redirect to the target.
+ */
+async function handleBotCheck(request, url, env, ctx) {
+  const code = url.pathname.split('/s/')[1];
+  if (!code || code.includes(':')) {
+    return new Response('Invalid short URL', { status: 400, headers: { 'Cache-Control': 'no-store' } });
+  }
+
+  try {
+    const mapping = await env.URL_MAPPINGS.get(code, { type: 'json' });
+    if (!mapping || mapping.deleted) {
+      return new Response(null, { status: 404, headers: { 'Cache-Control': 'no-store' } });
+    }
+    // Unprotected codes don't need the check: send the client to the plain redirect.
+    if (!mapping.block_bots) {
+      return new Response(null, { status: 303, headers: { Location: url.pathname, 'Cache-Control': 'no-store' } });
+    }
+    if (!turnstileConfigured(env)) {
+      return new Response('Bot protection is not configured', { status: 503, headers: { 'Cache-Control': 'no-store' } });
+    }
+
+    const form = await request.formData();
+    const token = form.get('cf-turnstile-response');
+    if (!token) {
+      return htmlResponse(botCheckPage(env, 'Verification failed.'), 400);
+    }
+
+    const verifyBody = new FormData();
+    verifyBody.append('secret', env.TURNSTILE_SECRET_KEY);
+    verifyBody.append('response', token);
+    const ip = request.headers.get('CF-Connecting-IP');
+    if (ip) verifyBody.append('remoteip', ip);
+    const verifyResp = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+      method: 'POST',
+      body: verifyBody,
+    });
+    const outcome = await verifyResp.json();
+    if (!outcome.success) {
+      return htmlResponse(botCheckPage(env, 'Verification failed.'), 403);
+    }
+
+    const exp = Math.floor(Date.now() / 1000) + BOT_PASS_TTL;
+    const sig = await hmacHex(env.TURNSTILE_SECRET_KEY, `bot_pass:${exp}`);
+    ctx.waitUntil(incrementStats(code, env));
+    return new Response(null, {
+      status: 303,
+      headers: {
+        Location: mapping.url,
+        'Cache-Control': 'no-store',
+        'Set-Cookie': `${BOT_PASS_COOKIE}=${exp}.${sig}; Path=/s/; Max-Age=${BOT_PASS_TTL}; HttpOnly; Secure; SameSite=Lax`,
+      },
+    });
+  } catch (error) {
+    console.error('Bot check failed:', error);
+    return new Response('Internal Server Error', { status: 500, headers: { 'Cache-Control': 'no-store' } });
+  }
 }

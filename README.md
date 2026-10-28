@@ -563,20 +563,55 @@ Cache is enabled in `cloudflare.config.ts` with `cache: { enabled: true }`. The 
 
 Workers Cache is a Cloudflare edge product and is **not** available in `cf dev`. The code guards against `ctx.cache` being undefined, so all endpoints continue to work normally without caching during local development.
 
-## Cost Analysis
+## URL enumeration
 
-Cloudflare Workers **free tier** per day:
-- 100,000 Worker requests
-- 1GB KV storage
-- 100,000 KV reads + 1,000 KV writes
+Short codes are guessable. Generated codes are 6 hex characters, so there are only 16⁶ ≈ 16.7M of them, and `GET /s/{code}` needs no authentication. Anyone can walk the code space and collect every target URL. Treat short links as public: don't rely on an unguessable code to protect a sensitive target URL.
 
-A typical blog gets ~500 short URL clicks/day — well within free tier.
+Scanning also costs you money or availability. Misses are never cached (see [Caching](#caching)), so each guess runs the Worker and does one KV read. On the free plan, about **100,000 requests in a UTC day** (≈1.2/s) exhausts the Worker request quota, and every route — including `/api/*` and `/signup` — fails until midnight UTC. That rate is far too low for Cloudflare's automatic DDoS protection to notice.
 
-| Service | Monthly cost |
-|---------|-------------|
-| Bitly Pro | $29 |
-| TinyURL Pro | $9.99 |
-| **This solution** | **$0** |
+### Rate limiting `/s/*` with a WAF rule
+
+A WAF rate-limiting rule blocks excess requests at the edge, before they reach the Worker. The free plan allows **one** rate-limiting rule, with a fixed 10-second period and 10-second block, counted per IP per data centre.
+
+Check for an existing rule first. The free plan only allows one, and the command below **replaces** the whole `http_ratelimit` ruleset:
+
+```bash
+npx cf rulesets entrypoint get http_ratelimit -z yourdomain.com
+```
+
+If no rate-limit rules exist yet, this **fails with an error**, which is expected and means it's safe to continue:
+
+```
+[10003] could not find entrypoint ruleset in the http_ratelimit phase
+404 Not Found
+```
+
+If it instead prints a ruleset, an existing rule is in place: add it to the `--rules` array below or it will be removed.
+
+Create the rule (20 requests per 10 seconds per IP on `/s/*`):
+
+```bash
+npx cf rulesets entrypoint update http_ratelimit -z yourdomain.com --rules '[{
+  "description": "Short-link enumeration",
+  "expression": "starts_with(http.request.uri.path, \"/s/\")",
+  "action": "block",
+  "ratelimit": {
+    "characteristics": ["ip.src", "cf.colo.id"],
+    "period": 10,
+    "requests_per_period": 20,
+    "mitigation_timeout": 10
+  }
+}]'
+```
+
+Add `--validate-only` to check the rule without saving it. To remove it later, run the same command with `--rules '[]'`.
+
+Notes:
+
+- **Threshold.** A real visitor makes one request per link (plus a POST for `block_bots` links). The rule runs before the cache, so cached redirects count toward the limit too. Keep it generous enough for shared IPs (offices, mobile carrier NAT); 20 per 10 s is a reasonable start.
+- **What it doesn't stop.** A single IP is still allowed up to ~172,800 requests a day, and a scan spread across many IPs is barely slowed. The rule makes enumeration slower and more expensive for the attacker; it doesn't prevent it.
+- **Higher plans** can count only misses (a counting expression on the response code, e.g. `http.response.code eq 404`), use longer periods, and pick other characteristics. Check Cloudflare's rate-limiting docs for which plan unlocks each option.
+- The real fix for guessability is longer codes (e.g. 8+ base62 characters), which makes a scan pointless rather than merely slower. That change would also need the PHP `previewShorten` updated to match.
 
 ## License
 

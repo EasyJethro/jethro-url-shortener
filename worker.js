@@ -2,7 +2,8 @@
  * Cloudflare Worker - Self-Hosted URL Shortener
  *
  * Features:
- * - Short URL redirects: /s/{code} → full URL
+ * - Short URL redirects: /s/{code}[/path][?query] → full URL, with extra
+ *   path appended and query merged (request params override target params)
  * - Full CRUD API with Bearer token authentication
  * - Soft delete + restore + permanent delete
  * - Self-service API keys: /signup mints a create-scoped key via Google/GitHub OAuth
@@ -32,8 +33,8 @@ export default {
     // Short URL redirect: /s/{code}. POST carries a Turnstile token for
     // block_bots URLs.
     if (url.pathname.startsWith('/s/')) {
-      if (request.method === 'POST') return handleBotCheck(request, url, env, ctx);
-      return handleShortUrl(request, url, env, ctx);
+      if (request.method === 'POST') return handleBotCheck(request, url, env);
+      return handleShortUrl(request, url, env);
     }
 
     // API: Create short URL (authenticated — admin or create)
@@ -137,8 +138,8 @@ export default {
  * Redirect /s/{code} to the target URL. block_bots URLs get a Turnstile
  * challenge page unless the client holds a valid pass cookie.
  */
-async function handleShortUrl(request, url, env, ctx) {
-  const code = url.pathname.split('/s/')[1];
+async function handleShortUrl(request, url, env) {
+  const { code, restPath } = parseShortPath(url);
 
   // Codes never contain ':' — reject early so reserved KV records
   // (apikey:, idx:, tok:, owner:) are unreachable via public routes
@@ -172,14 +173,14 @@ async function handleShortUrl(request, url, env, ctx) {
       // Never cache: the cache would serve the redirect to unchallenged clients.
       return new Response(null, {
         status: 302,
-        headers: { Location: mapping.url, 'Cache-Control': 'no-store' },
+        headers: { Location: buildTarget(mapping.url, restPath, url.search), 'Cache-Control': 'no-store' },
       });
     }
 
     return new Response(null, {
       status: 302,
       headers: {
-        Location: mapping.url,
+        Location: buildTarget(mapping.url, restPath, url.search),
         'Cache-Control': 'public, max-age=3600, stale-while-revalidate=86400',
         'Cache-Tag': `redirect:${code}`,
       },
@@ -660,6 +661,40 @@ async function sha256Hex(input) {
  */
 function isValidShortCode(code) {
   return typeof code === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(code);
+}
+
+/**
+ * Split a /s/ path into the short code and any trailing path.
+ * '/s/abc/x/y' → { code: 'abc', restPath: '/x/y' }; '/s/abc' → { code: 'abc', restPath: '' }.
+ * Codes never contain '/', so the first '/' after the code ends it.
+ */
+function parseShortPath(url) {
+  const tail = url.pathname.slice('/s/'.length);
+  const i = tail.indexOf('/');
+  return i === -1 ? { code: tail, restPath: '' } : { code: tail.slice(0, i), restPath: tail.slice(i) };
+}
+
+/**
+ * Merge a request's trailing path and query into the stored target URL.
+ * Path: appended to the target path without doubled slashes. Query: target
+ * params whose key the request also sets are dropped, then the request query
+ * is appended verbatim; untouched target params keep their original encoding.
+ * Scheme/host always come from the stored target.
+ */
+function buildTarget(targetUrl, restPath, search) {
+  if (!restPath && !search) return targetUrl;
+  const t = new URL(targetUrl);
+  if (restPath) t.pathname = t.pathname.replace(/\/+$/, '') + restPath.replace(/\/{2,}/g, '/');
+  if (search) {
+    const reqKeys = new Set(new URLSearchParams(search).keys());
+    const kept = t.search.slice(1).split('&').filter((pair) => {
+      if (!pair) return false;
+      const key = new URLSearchParams(`${pair.split('=')[0]}=`).keys().next().value;
+      return !reqKeys.has(key);
+    });
+    t.search = [...kept, search.slice(1)].join('&');
+  }
+  return t.toString();
 }
 
 /**
@@ -1629,8 +1664,8 @@ function botCheckPage(env, error = '') {
 /**
  * POST /s/{code} — verify a Turnstile token, then redirect to the target.
  */
-async function handleBotCheck(request, url, env, ctx) {
-  const code = url.pathname.split('/s/')[1];
+async function handleBotCheck(request, url, env) {
+  const { code, restPath } = parseShortPath(url);
   if (!code || code.includes(':')) {
     return new Response('Invalid short URL', { status: 400, headers: { 'Cache-Control': 'no-store' } });
   }
@@ -1642,7 +1677,7 @@ async function handleBotCheck(request, url, env, ctx) {
     }
     // Unprotected codes don't need the check: send the client to the plain redirect.
     if (!mapping.block_bots) {
-      return new Response(null, { status: 303, headers: { Location: url.pathname, 'Cache-Control': 'no-store' } });
+      return new Response(null, { status: 303, headers: { Location: url.pathname + url.search, 'Cache-Control': 'no-store' } });
     }
     if (!turnstileConfigured(env)) {
       return new Response('Bot protection is not configured', { status: 503, headers: { 'Cache-Control': 'no-store' } });
@@ -1673,7 +1708,7 @@ async function handleBotCheck(request, url, env, ctx) {
     return new Response(null, {
       status: 303,
       headers: {
-        Location: mapping.url,
+        Location: buildTarget(mapping.url, restPath, url.search),
         'Cache-Control': 'no-store',
         'Set-Cookie': `${BOT_PASS_COOKIE}=${exp}.${sig}; Path=/s/; Max-Age=${BOT_PASS_TTL}; HttpOnly; Secure; SameSite=Lax`,
       },

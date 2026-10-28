@@ -9,6 +9,7 @@ A production-ready, self-hosted URL shortener built with **Cloudflare Workers** 
 ## Features
 
 - **Short URL redirects** — `/s/{code}` → full URL, served from edge cache with stale-while-revalidate
+- **Path and query passthrough** — `/s/{code}/extra/path?x=1` appends the extra path and merges the query into the target
 - **Deterministic short codes** — SHA-256 hash of `(url, campaign, block_bots)` makes creation idempotent: same inputs always produce the same code
 - **Click analytics** — per-code redirect counts from Cloudflare zone analytics (includes cache hits; no KV writes on redirect)
 - **Full CRUD API** — create, list, update, soft-delete, restore, permanent-delete
@@ -47,10 +48,18 @@ devbox run shorten-protected https://my-webapp.fly.dev/
 
 and get a shortened URL that opens to a Cloudflare 'turnstile' page checking the requester is human, before redirecting to the shortened app.
 
+### Path and query passthrough
+
+Anything after the code is carried over to the target. If `https://yourdomain.com/s/33b18c` redirects to `https://my-webapp.fly.dev`, then `https://yourdomain.com/s/33b18c/?view=admin__system_configuration` redirects to `https://my-webapp.fly.dev/?view=admin__system_configuration`.
+
+- **Path:** the extra path is appended to the target path without doubling slashes (`/s/{code}/x` on target `https://h/base/` → `https://h/base/x`).
+- **Query:** request parameters are merged into the target's. Where both set the same key, the request wins (`?view=admin` on target `?keep=1&view=home` → `?keep=1&view=admin`); other target parameters keep their original encoding.
+- **Fragment:** a `#fragment` on the target is kept.
+- Applies to every link. The scheme and host always come from the stored target, so a crafted suffix can reach any path on the target host but never another host.
 
 ### No UTM parameter injection
 
-Upstream injects `utm_source`, `utm_medium`, `utm_campaign`, and `utm_content` query parameters on every redirect. This fork has removed all UTM tracking — redirects are clean, preserving only the original target URL.
+Upstream injects `utm_source`, `utm_medium`, `utm_campaign`, and `utm_content` query parameters on every redirect. This fork has removed all UTM tracking — redirects are clean, adding nothing beyond the original target URL and any path/query the visitor supplied.
 
 ### No click counting
 
@@ -144,7 +153,7 @@ devbox run -- php src/php/shorten.php https://example.com/my-post twitter
 
 `devbox run test` — PHP functional test against the live API: predicts a short code via `previewShorten()`, creates it via the live API, confirms the codes match, fetches the short URL, and validates the 302 redirect to the original target.
 
-`node test_worker.js` — Worker HTTP integration suite (20 tests). Point it at a deployed worker, or run the worker locally:
+`node test_worker.js` — Worker HTTP integration suite (29 tests). Point it at a deployed worker, or run the worker locally:
 
 ```bash
 # .dev.vars holds local values for secrets declared in cloudflare.config.ts

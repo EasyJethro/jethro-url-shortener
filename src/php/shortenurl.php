@@ -1,4 +1,5 @@
 <?php
+// SPDX-License-Identifier: Apache-2.0
 /**
  * URL Shortener library — create short URLs via jethro.au API.
  *

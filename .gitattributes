@@ -1,0 +1,22 @@
+# Composer installs from the GitHub archive: ship only the PHP client,
+# its tests, the licence and the docs; the Cloudflare worker, Python client
+# and tooling stay out of downstream vendor/ trees.
+/.gitattributes      export-ignore
+/.gitignore          export-ignore
+/.python-version     export-ignore
+/.env.example        export-ignore
+/client.py           export-ignore
+/main.py             export-ignore
+/pyproject.toml      export-ignore
+/requirements.txt    export-ignore
+/uv.lock             export-ignore
+/cloudflare.config.example.ts export-ignore
+/devbox.json         export-ignore
+/devbox.lock         export-ignore
+/package.json        export-ignore
+/pnpm-lock.yaml      export-ignore
+/pnpm-workspace.yaml export-ignore
+/vite.config.ts      export-ignore
+/worker.js           export-ignore
+/test_worker.js      export-ignore
+/scripts             export-ignore

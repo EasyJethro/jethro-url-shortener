@@ -1,5 +1,6 @@
 #!/usr/bin/env php
 <?php
+// SPDX-License-Identifier: Apache-2.0
 require_once __DIR__ . '/UrlShortener.php';
 
 $opts = getopt('', ['apitoken:', 'campaign:']);

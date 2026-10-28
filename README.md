@@ -615,4 +615,4 @@ Notes:
 
 ## License
 
-MIT — use freely in your own projects.
+Apache License 2.0 — see [LICENSE](LICENSE).

@@ -1,5 +1,6 @@
 #!/usr/bin/env php
 <?php
+// SPDX-License-Identifier: Apache-2.0
 require_once __DIR__ . '/UrlShortener.php';
 define('URLSHORTENER', getenv('URLSHORTENER') ?: 'jethroau');
 define('URLSHORTENER_API_KEY', getenv('URLSHORTENER_API_KEY') ?: '');

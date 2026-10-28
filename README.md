@@ -2,7 +2,7 @@
 
 A heavily modified fork of [IAMDevBox/cloudflare-url-shortener](https://github.com/IAMDevBox/cloudflare-url-shortener) deployed at [jethro.au](https://jethro.au), used for shortening URLs in Jethro SMSes.
 
-A production-ready, self-hosted URL shortener built with **Cloudflare Workers** and **KV storage**. Zero cost, global edge performance, and full CRUD admin API with click analytics.
+A production-ready, self-hosted URL shortener built with **Cloudflare Workers** and **KV storage**. Zero cost, global edge performance, and full CRUD admin API. Click counts come from Cloudflare zone analytics.
 
 > 📖 **Upstream tutorial**: [Building a Self-Hosted URL Shortener with Cloudflare Workers](https://www.iamdevbox.com/posts/building-self-hosted-url-shortener-cloudflare-workers/)
 
@@ -10,7 +10,7 @@ A production-ready, self-hosted URL shortener built with **Cloudflare Workers** 
 
 - **Short URL redirects** — `/s/{code}` → full URL, served from edge cache with stale-while-revalidate
 - **Deterministic short codes** — SHA-256 hash of `(url, campaign, block_bots)` makes creation idempotent: same inputs always produce the same code
-- **Click analytics** — per-code click counters in dedicated KV keys (reads never touch the URL mapping)
+- **Click analytics** — per-code redirect counts from Cloudflare zone analytics (includes cache hits; no KV writes on redirect)
 - **Full CRUD API** — create, list, update, soft-delete, restore, permanent-delete
 - **Multi-key authentication** — admin and create-only API keys with full CRUD management, revocable without rotating the bootstrap key
 - **Self-service signup** — anyone can obtain a create-only key via Google, GitHub, or email magic link at `/signup`
@@ -52,9 +52,9 @@ and get a shortened URL that opens to a Cloudflare 'turnstile' page checking the
 
 Upstream injects `utm_source`, `utm_medium`, `utm_campaign`, and `utm_content` query parameters on every redirect. This fork has removed all UTM tracking — redirects are clean, preserving only the original target URL.
 
-### Separate click stats
+### No click counting
 
-Upstream stores click statistics in `stats:{code}` KV keys with per-source breakdowns (twitter, linkedin, direct, etc.). This fork stores a simple `{ total }` counter in a dedicated `stats:{code}` key, separate from the URL mapping. Keeping clicks out of the mapping document prevents read-modify-write races where a concurrent admin mutation (delete, update) could be reverted by a stats write holding a stale copy of the mapping.
+Upstream stores click statistics in `stats:{code}` KV keys with per-source breakdowns (twitter, linkedin, direct, etc.). **This fork does not track clicks at all**: redirects write nothing, and there is no stats API endpoint. Use Cloudflare zone analytics instead (see [Click statistics](#click-statistics)). Zone analytics see every edge response, including redirects served from Workers Cache that never reach the Worker, so they are more accurate than an in-Worker counter. They also avoid KV writes, which are capped at 1,000/day on the free tier.
 
 ### Multi-key authentication
 
@@ -89,7 +89,7 @@ Setup is optional — see [step 5 of the Quick Start](#5-optional-enable-self-se
 devbox run test                 # Run functional tests
 devbox run deploy               # Redeploy the worker
 devbox run shorten <url> [c]    # Create a short URL
-devbox run stats <code>         # Get click stats
+devbox run stats <code> [--days N]   # Click counts from zone analytics (≤30 days)
 devbox run list-urls            # List all active URLs
 devbox run list-keys            # List API keys
 devbox run create-key <label> [--type <type>]   # Create an API key
@@ -163,11 +163,7 @@ BASE_URL=http://localhost:5173 API_KEY=test-key node test_worker.js
 ## Architecture
 
 ```
-User → /s/{code} → Cloudflare Worker (edge, <15ms) → KV lookup → 302 redirect
-                                                     ↓
-                                               Stats increment (async)
-                                               ↓
-                                          Edge cache (1h fresh, 24h stale)
+User → /s/{code} → Edge cache (1h fresh, 24h stale) → Cloudflare Worker (edge, <15ms) → KV lookup → 302 redirect
 ```
 
 ## Quick Start
@@ -356,20 +352,62 @@ Response:
 
 If the same URL + campaign was already created, the response includes `"existing": true` and returns the existing short code (idempotent). `block_bots` is part of the identity: protected and unprotected links to the same URL get different codes (hash of `url::campaign::block_bots`).
 
-`block_bots` links: `GET /s/{code}` returns a Turnstile page; the widget POSTs its token to `/s/{code}`, the worker verifies it with Cloudflare's siteverify API, then 303-redirects and sets a signed `bot_pass` cookie (30 minutes, all `/s/` links) so the visitor isn't challenged again. These responses are never cached, and clicks are counted only after a pass. CLI: `devbox run shorten-protected <url> [campaign]`.
+`block_bots` links: `GET /s/{code}` returns a Turnstile page; the widget POSTs its token to `/s/{code}`, the worker verifies it with Cloudflare's siteverify API, then 303-redirects and sets a signed `bot_pass` cookie (30 minutes, all `/s/` links) so the visitor isn't challenged again. These responses are never cached. CLI: `devbox run shorten-protected <url> [campaign]`.
 
-### Get click statistics
+### Click statistics
+
+The worker does **not** count clicks: there is no counter in KV and no `/api/stats` endpoint. Every request to `/s/{code}` is still logged by Cloudflare's zone analytics, and you can query those logs for free.
+
+Limits:
+
+- **31-day retention** on the free plan. Older data is gone; export it periodically if you need lifetime totals.
+- **Sampled counts.** The `events.httpRequests` dataset is adaptively sampled; `SUM(sampleInterval)` gives an estimate, exact at low traffic.
+- **No visitor detail beyond what Cloudflare logs.** Bots, link-preview fetchers (e.g. SMS/chat apps unfurling the link) and repeat visits all count as requests.
+
+#### CLI (per code)
 
 ```bash
-curl https://yourdomain.com/api/stats/oauth
+devbox run stats <code> [--days N]     # N = 1–30, default 30
 ```
 
-Response:
 ```json
 {
-  "total": 142
+  "code": "oauth",
+  "days": 7,
+  "clicks": 142,
+  "by_status": { "302": 142 }
 }
 ```
+
+`clicks` counts 302 (redirect) and 303 (redirect after bot check) responses for `/s/{code}` and `/s/{code}/…`. `by_status` shows everything else too, e.g. `200` for Turnstile challenge pages served to `block_bots` links. The command shells out to `npx cf`, which must be logged in (`npx cf auth`) with Analytics Read on the zone.
+
+#### Raw SQL (top codes, custom queries)
+
+`npx cf sql query` runs SQL against the analytics datasets. Queries must be scoped to the zone, and `ORDER BY` requires a `LIMIT`:
+
+```bash
+ZONE_ID=$(npx cf zones list --name yourdomain.com | jq -r '.[0].id')
+
+# Top 20 short codes by redirects over the last 7 days
+npx cf sql query --scope-zone "$ZONE_ID" "
+  SELECT clientRequestPath AS path, SUM(sampleInterval) AS clicks
+  FROM events.httpRequests
+  WHERE clientRequestPath LIKE '/s/%'
+    AND edgeResponseStatus IN (302, 303)
+    AND timestamp >= NOW() - INTERVAL '7' DAY
+  GROUP BY path ORDER BY clicks DESC LIMIT 20
+  FORMAT JSON"
+```
+
+Useful columns include `clientRequestPath`, `clientRequestHttpHost`, `clientRefererHost`, `edgeResponseStatus`, `timestamp` and `sampleInterval`. List them all with:
+
+```bash
+npx cf sql datasets --account-tag <account-id> --dataset-name events.httpRequests --include-columns
+```
+
+#### Dashboard
+
+In the Cloudflare dashboard, open the zone's HTTP traffic analytics and add a filter on path (e.g. starts with `/s/oauth`) to get the same counts as a chart.
 
 ### List all active URLs
 
@@ -479,31 +517,32 @@ Any valid key can revoke itself. This deletes the key from KV and scrubs the own
 
 ## Caching
 
-This worker uses [Cloudflare Workers Cache](https://blog.cloudflare.com/workers-cache/) to serve redirects and stats from edge cache, reducing latency and KV read costs.
+This worker uses [Cloudflare Workers Cache](https://blog.cloudflare.com/workers-cache/) to serve redirects from edge cache, reducing latency and KV read costs.
 
 ### Cached Endpoints
 
 | Endpoint | Cache Duration | Stale-while-revalidate |
 |---|---|---|
 | `GET /s/{code}` (redirect) | 1 hour (`max-age=3600`) | 24 hours |
-| `GET /api/stats/{code}` | 1 minute (`max-age=60`) | 5 minutes |
+
+Not cached (`no-store`): 404 for unknown or deleted codes, 400 for invalid codes, and all `block_bots` responses. A cached 404 would outlive the code being created (creation does not purge the cache), so every request for an unknown code runs the Worker and costs one KV read.
 
 ### How It Works
 
-- **Fresh window** (within `max-age`): The response is served directly from Cloudflare's edge cache. The Worker does NOT run, so click stats are NOT incremented during this window.
-- **Stale window** (`max-age` to `max-age + stale-while-revalidate`): The cached response is served immediately while the Worker runs in the background. Click stats ARE incremented during revalidation.
+- **Fresh window** (within `max-age`): The response is served directly from Cloudflare's edge cache. The Worker does NOT run.
+- **Stale window** (`max-age` to `max-age + stale-while-revalidate`): The cached response is served immediately while the Worker runs in the background to revalidate.
 - **After both windows**: A full cache miss occurs, and the Worker fetches from KV.
 
 ### Cache Invalidation
 
 Cache entries are automatically purged when a URL is mutated:
 
-- **Update** (`PUT /api/urls/{code}`) — purges redirect and stats cache for the affected code(s)
+- **Update** (`PUT /api/urls/{code}`) — purges redirect cache for the affected code(s)
 - **Delete** (`DELETE /api/urls/{code}`) — purges cache so deleted URLs return 404 immediately
 - **Restore** (`POST /api/urls/{code}/restore`) — purges cache so restored URLs are accessible
 - **Permanent delete** (`DELETE /api/urls/{code}/permanent`) — purges cache
 
-Cache tags used: `redirect:{code}` and `stats:{code}`.
+Cache tag used: `redirect:{code}`.
 
 Purges are eventually consistent — expect a few seconds of propagation delay across the edge before a purged code reliably returns a fresh (`MISS`) response.
 

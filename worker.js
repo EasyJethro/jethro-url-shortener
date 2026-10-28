@@ -4,7 +4,6 @@
  * Features:
  * - Short URL redirects: /s/{code} → full URL
  * - Full CRUD API with Bearer token authentication
- * - Click analytics tracking
  * - Soft delete + restore + permanent delete
  * - Self-service API keys: /signup mints a create-scoped key via Google/GitHub OAuth
  *
@@ -40,11 +39,6 @@ export default {
     // API: Create short URL (authenticated — admin or create)
     if (url.pathname === '/api/shorten' && request.method === 'POST') {
       return handleCreateShortUrl(request, env);
-    }
-
-    // API: Get click statistics (public)
-    if (url.pathname.startsWith('/api/stats/')) {
-      return handleGetStats(url, env);
     }
 
     // API: Key management (admin only)
@@ -176,14 +170,12 @@ async function handleShortUrl(request, url, env, ctx) {
         return htmlResponse(botCheckPage(env), 200);
       }
       // Never cache: the cache would serve the redirect to unchallenged clients.
-      ctx.waitUntil(incrementStats(code, env));
       return new Response(null, {
         status: 302,
         headers: { Location: mapping.url, 'Cache-Control': 'no-store' },
       });
     }
 
-    ctx.waitUntil(incrementStats(code, env));
     return new Response(null, {
       status: 302,
       headers: {
@@ -285,7 +277,6 @@ async function handleCreateShortUrl(request, env) {
       url: longUrl,
       campaign,
       created: new Date().toISOString(),
-      stats: { total: 0 },
       ...(blockBots ? { block_bots: true } : {}),
     };
 
@@ -316,36 +307,6 @@ async function handleCreateShortUrl(request, env) {
 }
 
 /**
- * GET /api/stats/{code} — Get click statistics for a short URL
- */
-async function handleGetStats(url, env) {
-  const code = url.pathname.split('/api/stats/')[1];
-
-  if (!code || code.includes(':')) {
-    return jsonResponse({ error: 'Invalid code' }, 400);
-  }
-
-  try {
-    const mapping = await env.URL_MAPPINGS.get(code, { type: 'json' });
-
-    if (!mapping || mapping.deleted) {
-      return jsonResponse({ error: 'Stats not found' }, 404);
-    }
-
-    const statsData = await env.URL_MAPPINGS.get(`stats:${code}`, { type: 'json' });
-    const data = (statsData && typeof statsData.total === 'number') ? statsData : { total: 0 };
-    const response = jsonResponse(data);
-    // Workers Cache: 1 minute fresh, 5 minute stale-while-revalidate
-    response.headers.set('Cache-Control', 'public, max-age=60, stale-while-revalidate=300');
-    response.headers.set('Cache-Tag', `stats:${code}`);
-    return response;
-  } catch (error) {
-    console.error('Error getting stats:', error);
-    return jsonResponse({ error: 'Internal Server Error' }, 500);
-  }
-}
-
-/**
  * GET /api/urls — List all active (non-deleted) URLs
  */
 async function handleListUrls(request, env) {
@@ -365,19 +326,16 @@ async function handleListUrls(request, env) {
       totalKeys += listResult.keys.length;
 
       for (const key of listResult.keys) {
-        if (key.name.includes(':')) continue; // skip reserved records (stats:, idx:, apikey:, tok:, owner:)
+        if (key.name.includes(':')) continue; // skip reserved records (idx:, apikey:, tok:, owner:)
 
         const mapping = await env.URL_MAPPINGS.get(key.name, { type: 'json' });
         if (!mapping || mapping.deleted) continue;
-
-        const statsData = await env.URL_MAPPINGS.get(`stats:${key.name}`, { type: 'json' });
 
         urls.push({
           code: key.name,
           url: mapping.url,
           campaign: mapping.campaign,
           created: mapping.created,
-          stats: (statsData && typeof statsData.total === 'number') ? statsData : { total: 0 },
           ...(mapping.notes ? { notes: mapping.notes } : {}),
           ...(mapping.createdBy ? { createdBy: mapping.createdBy } : {}),
           ...(mapping.createdByCampaign ? { createdByCampaign: mapping.createdByCampaign } : {}),
@@ -457,7 +415,6 @@ async function handleUpdateUrl(request, url, env, ctx) {
       campaign: campaign !== undefined ? campaign : existing.campaign,
       created: existing.created,
       updated: new Date().toISOString(),
-      stats: existing.stats || { total: 0 },
     };
 
     if (existing.deleted !== undefined) updated.deleted = existing.deleted;
@@ -587,7 +544,7 @@ async function handleListDeletedUrls(request, env) {
       const listResult = await env.URL_MAPPINGS.list({ cursor });
 
       for (const key of listResult.keys) {
-        if (key.name.includes(':')) continue; // skip reserved records (stats:, idx:, apikey:, tok:, owner:)
+        if (key.name.includes(':')) continue; // skip reserved records (idx:, apikey:, tok:, owner:)
 
         const mapping = await env.URL_MAPPINGS.get(key.name, { type: 'json' });
         if (mapping && mapping.deleted) {
@@ -653,25 +610,6 @@ async function handlePermanentDelete(request, url, env, ctx) {
 }
 
 /**
- * Increment click stats in a separate KV key so clicks never rewrite the
- * URL mapping document.  This avoids the read-modify-write race where a
- * concurrent admin mutation (delete, update) could be reverted by a stats
- * write holding a stale copy of the mapping.
- *
- * Called via ctx.waitUntil — non-blocking for the redirect response.
- */
-async function incrementStats(code, env) {
-  try {
-    const statsKey = `stats:${code}`;
-    const existing = await env.URL_MAPPINGS.get(statsKey, { type: 'json' });
-    const total = (existing && typeof existing.total === 'number') ? existing.total + 1 : 1;
-    await env.URL_MAPPINGS.put(statsKey, JSON.stringify({ total }));
-  } catch (error) {
-    console.error('Error incrementing stats:', error);
-  }
-}
-
-/**
  * Generate a deterministic short code from URL + campaign hash.
  * Uses the first 6 chars of SHA-256 hex digest.
  * Falls back to random if the deterministic code is taken (collision).
@@ -718,7 +656,7 @@ async function sha256Hex(input) {
 /**
  * Short codes: 1-64 chars of [A-Za-z0-9_-].
  * Excludes ':' so user codes can never collide with reserved KV prefixes
- * (stats:, idx:, apikey:, tok:, owner:).
+ * (idx:, apikey:, tok:, owner:).
  */
 function isValidShortCode(code) {
   return typeof code === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(code);
@@ -756,7 +694,7 @@ function purgeCacheForCode(ctx, code) {
     console.warn('Workers Cache unavailable; skipping purge for', code);
     return;
   }
-  const tags = [`redirect:${code}`, `stats:${code}`];
+  const tags = [`redirect:${code}`];
   ctx.waitUntil(
     ctx.cache.purge({ tags }).catch((err) => {
       console.error('Error purging cache for', code, err);
@@ -1732,7 +1670,6 @@ async function handleBotCheck(request, url, env, ctx) {
 
     const exp = Math.floor(Date.now() / 1000) + BOT_PASS_TTL;
     const sig = await hmacHex(env.TURNSTILE_SECRET_KEY, `bot_pass:${exp}`);
-    ctx.waitUntil(incrementStats(code, env));
     return new Response(null, {
       status: 303,
       headers: {

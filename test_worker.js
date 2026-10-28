@@ -157,15 +157,6 @@ async function runTests() {
     assert(resp.status === 400, `Expected 400, got ${resp.status}`);
   });
 
-  // Stats
-  console.log('\n📊 Statistics');
-  await test('GET /api/stats/{code} returns stats', async () => {
-    const resp = await fetch(`${BASE_URL}/api/stats/${testCode}`);
-    assert(resp.status === 200, `Expected 200, got ${resp.status}`);
-    const stats = await resp.json();
-    assert(typeof stats.total === 'number', 'stats.total should be a number');
-  });
-
   // List
   console.log('\n📋 List URLs');
   await test('GET /api/urls returns list', async () => {

@@ -104,10 +104,10 @@ Environment configured via `.env` (gitignored) and `devbox.json` `env` field, wh
 
 Jethro is PHP, so we provide a PHP library for interacting with the shortener.
 
-`src/UrlShortener.php` — interface + factory for use in any PHP project:
+`src/php/UrlShortener.php` — interface + factory for use in any PHP project:
 
 ```php
-require_once 'src/UrlShortener.php';
+require_once 'src/php/UrlShortener.php';
 
 define('URLSHORTENER', 'jethroau');
 define('URLSHORTENER_API_KEY', 'cus_...');
@@ -133,10 +133,10 @@ $signupUrl = $s->getSignupUrl('https://my.app/callback', 'my-organisation');
 // → https://jethro.au/signup?redirect=...&campaign=my-organisation
 ```
 
-`shorten.php` — CLI frontend using the library:
+`src/php/shorten.php` — CLI frontend using the library:
 
 ```bash
-devbox run -- php shorten.php https://example.com/my-post twitter
+devbox run -- php src/php/shorten.php https://example.com/my-post twitter
 # → https://jethro.au/s/abc123
 ```
 

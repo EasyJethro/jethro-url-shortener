@@ -15,7 +15,7 @@
       "echo 'Ready — jethro.au shortener' > /dev/null"
     ],
     "scripts": {
-      "test":            "php test.php \"$@\"",
+      "test":            "php src/php/test.php \"$@\"",
       "deploy": "npx cf deploy",
       "help": [
         "echo '  deploy                          Redeploy the worker'",

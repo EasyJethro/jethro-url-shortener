@@ -1,7 +1,7 @@
 {
-    "name": "jefft/jethro-url-shortener",
+    "name": "easyjethro/jethro-url-shortener",
     "description": "Self-hosted URL shortener on Cloudflare Workers with deterministic codes and multi-key auth",
-    "type": "project",
+    "type": "library",
     "license": "Apache-2.0",
     "require": {
         "php": ">=8.1",

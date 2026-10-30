@@ -1,5 +1,5 @@
 {
-    "name": "easyjethro/jethro-url-shortener",
+    "name": "jethro/jethro-url-shortener",
     "description": "Self-hosted URL shortener on Cloudflare Workers with deterministic codes and multi-key auth",
     "type": "library",
     "license": "Apache-2.0",

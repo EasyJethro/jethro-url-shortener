@@ -180,7 +180,7 @@ User → /s/{code} → Edge cache (1h fresh, 24h stale) → Cloudflare Worker (e
 ### 1. Clone and install
 
 ```bash
-git clone git@github.com:EasyJethro/jethro-url-shortener.git
+git clone git@github.com:jethro-chms/jethro-url-shortener.git
 cd jethro-url-shortener
 devbox shell         # provisions Node.js 24 + PHP 8.4
 npm install

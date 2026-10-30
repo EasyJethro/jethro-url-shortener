@@ -97,7 +97,7 @@ export default {
 <html lang="en">
 <head><meta charset="utf-8"><title>jethro.au</title></head>
 <body>
-  <p>jethro.au hosts web services for use by any installation of the Jethro church management system. Currently it runs a <a href="https://github.com/jefft/jethro-url-shortener">URL shortener</a>, with signup initiated in Jethro's System Configuration page. For more info, contact <a href="mailto:support@easyjethro.com.au">support@easyjethro.com.au</a>.</p>
+  <p>jethro.au hosts web services for use by any installation of the Jethro church management system. Currently it runs a <a href="https://github.com/jethro-chms/jethro-url-shortener">URL shortener</a>, with signup initiated in Jethro's System Configuration page. For more info, contact <a href="mailto:support@easyjethro.com.au">support@easyjethro.com.au</a>.</p>
 </body>
 </html>`);
     }

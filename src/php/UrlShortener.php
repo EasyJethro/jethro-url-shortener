@@ -128,11 +128,44 @@ function getUrlShortener(): UrlShortener
 {
     static $shortener = null;
     if ($shortener !== null) return $shortener;
-    $key = defined('URLSHORTENER') ? (string) URLSHORTENER : 'https://jethro.au';
-    if ($key === '') throw new \RuntimeException('URLSHORTENER not configured');
-    $shortener = match ($key) {
-        'jethroau', 'https://jethro.au' => new JethroAuUrlShortener(apiKey: defined('URLSHORTENER_API_KEY') ? (string) URLSHORTENER_API_KEY : ''),
-        default => throw new \RuntimeException("Unknown URL shortener: $key"),
-    };
-    return $shortener;
+    $config = urlShortenerConfig();
+    if (!$config['configured']) {
+        throw new \RuntimeException('URLSHORTENER not configured');
+    }
+    if (!$config['supported']) {
+        throw new \RuntimeException("Unsupported URLSHORTENER: {$config['raw']}. Use 'jethroau' or 'https://jethro.au'.");
+    }
+    return $shortener = new JethroAuUrlShortener(
+        apiKey: defined('URLSHORTENER_API_KEY') ? (string) URLSHORTENER_API_KEY : '',
+        endpoint: $config['base'] . '/api/shorten',
+        signupBase: $config['base'],
+    );
+}
+
+/**
+ * Interpret the URLSHORTENER setting — the one definition of what it may be.
+ *
+ * Both getUrlShortener() (which shortens) and the status panel (which reports
+ * whether shortening works) use this, so the panel cannot say "Operational"
+ * while every shorten call throws.
+ *
+ * Accepts 'jethroau' or 'https://jethro.au', case-insensitively and with any
+ * trailing slashes. Blank means "not configured": getUrlShortener() then throws.
+ *
+ * @return array{raw: string, configured: bool, supported: bool, base: string}
+ *         raw: the setting as written; configured: not blank; supported: usable;
+ *         base: canonical service URL ('' when blank or unsupported)
+ */
+function urlShortenerConfig(?string $setting = null): array
+{
+    $raw = trim($setting ?? (defined('URLSHORTENER') ? (string) URLSHORTENER : 'https://jethro.au'));
+    $key = rtrim($raw, '/');
+    $supported = $key !== ''
+        && (strcasecmp($key, 'jethroau') === 0 || strcasecmp($key, 'https://jethro.au') === 0);
+    return [
+        'raw' => $raw,
+        'configured' => $key !== '',
+        'supported' => $supported,
+        'base' => $supported ? 'https://jethro.au' : '',
+    ];
 }
